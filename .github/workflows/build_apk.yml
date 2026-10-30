@@ -1,0 +1,251 @@
+name: Build and Deploy APK to Telegram
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build'
+        required: false
+        default: 'master'
+        type: string
+      tag:
+        description: 'Optional label added to the file name (e.g. test)'
+        required: false
+        default: ''
+        type: string
+      env:
+        description: 'API environment (testing | production, empty = as in code)'
+        required: false
+        default: ''
+        type: string
+
+# `actions: read` lets the failure-notifier step download the run's logs zip
+# (GET /repos/{repo}/actions/runs/{id}/logs). Declared explicitly so the
+# workflow works regardless of the repo's default token permissions.
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-and-deploy:
+    name: Build APK and deliver to Telegram
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Free disk space
+        # ubuntu-latest has ~14 GB free; Flutter + the NDK + Gradle caches + the
+        # build output can exhaust it ("No space left on device", runner crash).
+        # Drop preinstalled toolchains these builds never use. Keeps the Android
+        # SDK, Java, Python and the tool cache that setup-* actions rely on.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/share/boost /usr/share/swift /usr/local/share/powershell \
+            /usr/local/share/chromium /usr/local/lib/node_modules \
+            /opt/hostedtoolcache/CodeQL /opt/microsoft /opt/google /opt/az || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14.4'
+          cache: 'pip'
+          cache-dependency-path: .github/workflows/build_apk.yml
+
+      - name: Install Telegram uploader dependencies
+        # kurigram is a maintained pyrogram fork (drop-in, same `from pyrogram import ...`)
+        # that accepts the newer large Telegram channel IDs (e.g. -100 3 8xxxxxxxxx).
+        # Installed early so the failure-notify step always has its deps,
+        # even if Java/Flutter setup fails.
+        run: pip install "kurigram==2.2.22" "tgcrypto==1.2.5"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17.0.10'
+          
+      - name: Accept Android SDK Licenses & Install NDK
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;29.0.14033849"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.5'
+          channel: 'stable'
+          cache: true
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Switch API environment
+        # Rewrites the hard-coded base URLs in the checked-out copy (never
+        # committed). Skipped when the bot sent no env or the repo has no
+        # API_ENV_CONFIG, so unconfigured projects build exactly as before.
+        if: ${{ inputs.env != '' && vars.API_ENV_CONFIG != '' }}
+        env:
+          API_ENV_CONFIG: ${{ vars.API_ENV_CONFIG }}
+          TARGET_ENV: ${{ inputs.env }}
+          PYTHONUTF8: '1'  # emoji output on Windows runners
+        run: python .github/scripts/swap_base_url.py
+
+      - name: Prepare release signing
+        # Reads android/app/build.gradle(.kts): if the release build is signed
+        # with a keystore, puts key.properties + .jks where THAT gradle expects
+        # them — copied from the repo (necessary_files/ first) or written from
+        # the KEYSTORE_* secrets. Debug-signed apps build untouched.
+        id: signing
+        env:
+          KEYSTORE_BASE64:   ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD:      ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS:         ${{ secrets.KEY_ALIAS }}
+          PYTHONUTF8: '1'
+        run: |
+          if [ ! -f .github/scripts/prepare_signing.py ]; then
+            echo "::warning::.github/scripts/prepare_signing.py missing — run 🔄 تحديث الـ workflows from the bot"
+            exit 0
+          fi
+          python .github/scripts/prepare_signing.py
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Resolve commit message
+        id: commit
+        env:
+          RAW_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          MSG="$RAW_MESSAGE"
+          if [ -z "$MSG" ]; then
+            MSG="$(git log -1 --pretty=%B)"
+          fi
+          {
+            echo 'message<<__EOF_COMMIT__'
+            echo "$MSG"
+            echo '__EOF_COMMIT__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Read version from pubspec
+        id: version
+        run: |
+          if [ -f pubspec.yaml ]; then
+            VER="$(grep -E '^version:' pubspec.yaml | awk '{print $2}' | cut -d'+' -f1)"
+          else
+            VER=""
+          fi
+          echo "number=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Compute artifact filename
+        id: artifact
+        shell: bash
+        env:
+          APP: ${{ vars.APP_NAME }}
+          VER: ${{ steps.version.outputs.number }}
+          SHA: ${{ steps.sha.outputs.short }}
+          BRANCH: ${{ github.ref_name }}
+          TAG: ${{ github.event.inputs.tag }}
+          API_ENV: ${{ github.event.inputs.env }}
+          PLATFORM: ''
+          EXT: 'apk'
+          TEMPLATE: ${{ vars.FILENAME_TEMPLATE }}
+        run: |
+          set -euo pipefail
+          # Fill the token template (repo variable FILENAME_TEMPLATE, or the
+          # default below) to name the artifact. Tokens:
+          #   {app} {version} {sha} {date} {branch} {platform} {tag} {env}
+          # {platform} is substituted only when its token is in the template
+          # (never auto-appended — a windows/web build on the default template
+          # keeps a clean name). {tag} is substituted in place, or appended when
+          # set but absent from the template, so a typed tag is never lost.
+          TEMPLATE="${TEMPLATE:-}"
+          [ -n "$TEMPLATE" ] || TEMPLATE='{app}-{tag}-{version}_{date}'
+          DATE="$(date -u +%d-%m)"; DATE="${DATE#0}"; DATE="${DATE/-0/-}"
+          clean() { printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-//; s/-$//'; }
+          APP="$(clean "${APP:-}")"; VER="$(clean "${VER:-}")"; SHA="$(clean "${SHA:-}")"
+          BRANCH="$(clean "${BRANCH:-}")"; TAG="$(clean "${TAG:-}")"; PLATFORM="$(clean "${PLATFORM:-}")"
+          NAME="$TEMPLATE"
+          NAME="${NAME//\{app\}/$APP}"
+          NAME="${NAME//\{version\}/$VER}"
+          NAME="${NAME//\{sha\}/$SHA}"
+          NAME="${NAME//\{date\}/$DATE}"
+          NAME="${NAME//\{branch\}/$BRANCH}"
+          pseg=""; [ -n "$PLATFORM" ] && pseg="-$PLATFORM"
+          NAME="${NAME//\{platform\}/$pseg}"
+          tseg=""; [ -n "$TAG" ] && tseg="-$TAG"
+          if [[ "$NAME" == *'{tag}'* ]]; then NAME="${NAME//'{tag}'/$tseg}"; else NAME="$NAME$tseg"; fi
+          # {env} (test|prod) is opt-in: filled only where the template has the
+          # token, never appended (the env is already in the Telegram caption).
+          case "${API_ENV:-}" in testing) ESEG="-test";; production) ESEG="-prod";; *) ESEG="";; esac
+          NAME="${NAME//'{env}'/$ESEG}"
+          NAME="$(printf '%s' "$NAME" | sed -E 's/[-_]{2,}/-/g; s/[-_]+\./\./g; s/^[-_]+//; s/[-_]+$//')"
+          [ -z "$NAME" ] && NAME="${APP:-build}"
+          echo "name=${NAME}.${EXT}" >> "$GITHUB_OUTPUT"
+
+      - name: Send APK to Telegram
+        env:
+          API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_MESSAGE: ${{ steps.commit.outputs.message }}
+          ARTIFACT_PATH: build/app/outputs/flutter-apk/app-release.apk
+          ARTIFACT_LABEL: APK
+          API_ENV: ${{ inputs.env }}
+          ARTIFACT_FILENAME: ${{ steps.artifact.outputs.name }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          TOPIC_ID: ${{ vars.TOPIC_ID }}
+        run: python .github/scripts/send_to_telegram.py
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TOPIC_ID:  ${{ vars.TOPIC_ID }}
+          APP_NAME:  ${{ vars.APP_NAME }}
+          BRANCH:    ${{ github.ref_name }}
+          REPO:      ${{ github.repository }}
+          RUN_ID:    ${{ github.run_id }}
+          WORKFLOW:  ${{ github.workflow }}
+          SIGNING_ERROR: ${{ steps.signing.outputs.error }}
+        run: |
+          REASON=""
+          [ -n "$SIGNING_ERROR" ] && REASON=$(printf '\n🔐 *Signing:* `%s`\n' "${SIGNING_ERROR//\`/}")
+          TEXT=$(cat <<EOF
+          ❌ *Build Failed!*
+
+          فيه حاجة غلطت أثناء بناء \`$APP_NAME\` على البرانش \`$BRANCH\`.
+          $REASON
+          🔧 *Workflow:* \`$WORKFLOW\`
+
+          🔗 [افتح تفاصيل الـ run على GitHub](https://github.com/$REPO/actions/runs/$RUN_ID)
+          EOF
+          )
+          THREAD_ARGS=()
+          [ -n "$TOPIC_ID" ] && THREAD_ARGS=(--data-urlencode "message_thread_id=$TOPIC_ID")
+          curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$CHAT_ID" \
+            "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=$TEXT" \
+            --data-urlencode "parse_mode=Markdown" \
+            --data-urlencode "disable_web_page_preview=true"
+
+      - name: Cleanup signing files
+        # Removes only what prepare_signing.py wrote; repo files are left alone.
+        if: always()
+        run: |
+          LIST="$RUNNER_TEMP/signing_created.txt"
+          [ -f "$LIST" ] && xargs -d '\n' rm -f -- < "$LIST" || true
